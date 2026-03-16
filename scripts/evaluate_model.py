@@ -4,19 +4,30 @@ import torch
 
 from attrdict import AttrDict
 
-from sgan.data.loader import data_loader
+from sgan.data.loader import data_loader, highd_data_loader
 from sgan.models import TrajectoryGenerator
 from sgan.losses import displacement_error, final_displacement_error
-from sgan.utils import relative_to_abs, get_dset_path
+from sgan.utils import relative_to_abs, get_dset_path, bool_flag
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str)
 parser.add_argument('--num_samples', default=20, type=int)
 parser.add_argument('--dset_type', default='test', type=str)
+# HighD evaluation options (override checkpoint defaults if needed)
+parser.add_argument('--use_highd', default=None, type=bool_flag,
+                    help='Override use_highd from checkpoint. '
+                         'Set to 1 when evaluating a HighD-trained model.')
+parser.add_argument('--highd_mmap_path', default=None, type=str,
+                    help='Override mmap path for evaluation.')
+parser.add_argument('--highd_val_path', default='', type=str,
+                    help='Separate mmap directory to use as test/val set.')
+parser.add_argument('--highd_val_ratio', default=0.1, type=float)
 
 
 def get_generator(checkpoint):
     args = AttrDict(checkpoint['args'])
+    # Backward compat: old checkpoints may not have HighD / nb_feat_dim args
+    nb_feat_dim = args.get('nb_feat_dim', 7 if args.get('use_I', False) else 6)
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,
         pred_len=args.pred_len,
@@ -34,7 +45,9 @@ def get_generator(checkpoint):
         bottleneck_dim=args.bottleneck_dim,
         neighborhood_size=args.neighborhood_size,
         grid_size=args.grid_size,
-        batch_norm=args.batch_norm)
+        batch_norm=args.batch_norm,
+        nb_feat_dim=nb_feat_dim,
+        nb_K=8)
     generator.load_state_dict(checkpoint['g_state'])
     generator.cuda()
     generator.train()
@@ -55,21 +68,36 @@ def evaluate_helper(error, seq_start_end):
     return sum_
 
 
+def _unpack_eval_batch(args, batch):
+    batch = [tensor.cuda() for tensor in batch]
+    use_highd = getattr(args, 'use_highd', False)
+    if use_highd:
+        (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+         non_linear_ped, loss_mask, seq_start_end,
+         nb_feats, nb_mask) = batch
+    else:
+        (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+         non_linear_ped, loss_mask, seq_start_end) = batch
+        nb_feats = nb_mask = None
+    return (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+            non_linear_ped, loss_mask, seq_start_end, nb_feats, nb_mask)
+
+
 def evaluate(args, loader, generator, num_samples):
     ade_outer, fde_outer = [], []
     total_traj = 0
     with torch.no_grad():
         for batch in loader:
-            batch = [tensor.cuda() for tensor in batch]
             (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
-             non_linear_ped, loss_mask, seq_start_end) = batch
+             non_linear_ped, loss_mask, seq_start_end,
+             nb_feats, nb_mask) = _unpack_eval_batch(args, batch)
 
             ade, fde = [], []
             total_traj += pred_traj_gt.size(1)
 
             for _ in range(num_samples):
                 pred_traj_fake_rel = generator(
-                    obs_traj, obs_traj_rel, seq_start_end
+                    obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask
                 )
                 pred_traj_fake = relative_to_abs(
                     pred_traj_fake_rel, obs_traj[-1]
@@ -105,11 +133,28 @@ def main(args):
         checkpoint = torch.load(path)
         generator = get_generator(checkpoint)
         _args = AttrDict(checkpoint['args'])
-        path = get_dset_path(_args.dataset_name, args.dset_type)
-        _, loader = data_loader(_args, path)
+
+        # CLI overrides for HighD evaluation
+        if args.use_highd is not None:
+            _args['use_highd'] = args.use_highd
+        if args.highd_mmap_path is not None:
+            _args['highd_mmap_path'] = args.highd_mmap_path
+        _args['highd_val_path']  = args.highd_val_path
+        _args['highd_val_ratio'] = args.highd_val_ratio
+
+        use_highd = _args.get('use_highd', False)
+        if use_highd:
+            mmap_path = _args.get('highd_mmap_path', 'data/highD/mmap')
+            _, loader = highd_data_loader(_args, mmap_path, split='val')
+            dataset_label = 'HighD'
+        else:
+            dset_path = get_dset_path(_args.dataset_name, args.dset_type)
+            _, loader = data_loader(_args, dset_path)
+            dataset_label = _args.dataset_name
+
         ade, fde = evaluate(_args, loader, generator, args.num_samples)
         print('Dataset: {}, Pred Len: {}, ADE: {:.2f}, FDE: {:.2f}'.format(
-            _args.dataset_name, _args.pred_len, ade, fde))
+            dataset_label, _args.pred_len, ade, fde))
 
 
 if __name__ == '__main__':

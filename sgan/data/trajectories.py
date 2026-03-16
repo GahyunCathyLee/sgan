@@ -1,6 +1,7 @@
 import logging
 import os
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -9,6 +10,155 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HighD dataset
+# ─────────────────────────────────────────────────────────────────────────────
+
+# x_nb feature indices: dx(0) dy(1) dvx(2) dvy(3) dax(4) day(5) I(12)
+_NB_BASE_INDICES = [0, 1, 2, 3, 4, 5]
+_NB_I_INDEX = 12
+
+
+class HighDDataset(Dataset):
+    """
+    Dataset that reads memory-mapped arrays produced by preprocess.py.
+
+    Each sample corresponds to one ego vehicle scenario:
+      obs : ego (x, y) history of length obs_len
+      pred: ego (x, y) future  of length pred_len
+      nb_feats : neighbor features (obs_len, K, nb_feat_dim)
+                 features = [dx, dy, dvx, dvy, dax, day] + optionally [I]
+      nb_mask  : (K,) bool — True if that neighbor slot is ever occupied
+
+    The batch collated by seq_collate_highd has the same first-7-field
+    layout as the original seq_collate so that discriminator_step /
+    generator_step can share most of their code:
+
+      obs_traj, pred_traj, obs_traj_rel, pred_traj_rel,
+      non_linear_ped, loss_mask, seq_start_end,
+      nb_feats, nb_mask
+    """
+
+    def __init__(self, mmap_path, obs_len=None, pred_len=None,
+                 use_I=False, indices=None, threshold=0.002):
+        super().__init__()
+        mmap_path = Path(mmap_path)
+
+        # Memory-mapped arrays (read-only, zero copy)
+        self.x_ego   = np.load(mmap_path / 'x_ego.npy',   mmap_mode='r')  # (N, T, 6)
+        self.y       = np.load(mmap_path / 'y.npy',        mmap_mode='r')  # (N, Tf, 2)
+        self.x_nb    = np.load(mmap_path / 'x_nb.npy',    mmap_mode='r')  # (N, T, K, 13)
+        self.nb_mask = np.load(mmap_path / 'nb_mask.npy', mmap_mode='r')  # (N, T, K)
+
+        T_mmap  = self.x_ego.shape[1]
+        Tf_mmap = self.y.shape[1]
+
+        self.obs_len  = obs_len  if obs_len  is not None else T_mmap
+        self.pred_len = pred_len if pred_len is not None else Tf_mmap
+
+        if self.obs_len != T_mmap or self.pred_len != Tf_mmap:
+            raise ValueError(
+                f"Requested obs_len={self.obs_len}, pred_len={self.pred_len} "
+                f"but mmap has T={T_mmap}, Tf={Tf_mmap}. "
+                "Re-run preprocess.py with matching --history_sec / --future_sec, "
+                "or omit --obs_len / --pred_len to use mmap dimensions."
+            )
+
+        self.use_I     = use_I
+        self.threshold = threshold
+        self.nb_feat_indices = _NB_BASE_INDICES + ([_NB_I_INDEX] if use_I else [])
+
+        N = self.x_ego.shape[0]
+        self.indices = np.asarray(indices) if indices is not None else np.arange(N)
+
+    @property
+    def nb_feat_dim(self):
+        return len(self.nb_feat_indices)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item):
+        idx = int(self.indices[item])
+
+        # ── ego trajectory (x, y) ─────────────────────────────────────────
+        x_ego = np.array(self.x_ego[idx], dtype=np.float32)   # (T, 6)
+        obs_xy = x_ego[:, :2]                                  # (T, 2)
+
+        obs_rel = np.zeros_like(obs_xy)
+        obs_rel[1:] = obs_xy[1:] - obs_xy[:-1]
+
+        # ── future trajectory ──────────────────────────────────────────────
+        y = np.array(self.y[idx], dtype=np.float32)            # (Tf, 2)
+
+        pred_rel = np.zeros_like(y)
+        pred_rel[0]  = y[0] - obs_xy[-1]
+        pred_rel[1:] = y[1:] - y[:-1]
+
+        # ── non-linear flag (same poly_fit as TrajectoryDataset) ───────────
+        # poly_fit expects shape (2, seq_len)
+        nl = poly_fit(obs_xy.T, self.obs_len, self.threshold)
+
+        # ── neighbor features ──────────────────────────────────────────────
+        x_nb_raw = np.array(self.x_nb[idx], dtype=np.float32)       # (T, K, 13)
+        nb_feats = x_nb_raw[:, :, self.nb_feat_indices]              # (T, K, F)
+
+        mask_raw = np.array(self.nb_mask[idx])                       # (T, K) bool
+        nb_mask  = mask_raw.any(axis=0)                              # (K,)
+
+        # ── loss mask (all ones — no padding for HighD samples) ───────────
+        loss_mask = np.ones(self.obs_len + self.pred_len, dtype=np.float32)
+
+        return (
+            torch.from_numpy(obs_xy).float(),      # (T, 2)
+            torch.from_numpy(y).float(),            # (Tf, 2)
+            torch.from_numpy(obs_rel).float(),      # (T, 2)
+            torch.from_numpy(pred_rel).float(),     # (Tf, 2)
+            torch.tensor(nl).float(),               # scalar
+            torch.from_numpy(nb_feats).float(),     # (T, K, F)
+            torch.from_numpy(nb_mask),              # (K,) bool
+            torch.from_numpy(loss_mask).float(),    # (T+Tf,)
+        )
+
+
+def seq_collate_highd(data):
+    """
+    Collate for HighDDataset.
+
+    Returns a 9-tuple that extends the original seq_collate 7-tuple:
+      obs_traj       (T_obs,  B, 2)
+      pred_traj      (T_pred, B, 2)
+      obs_traj_rel   (T_obs,  B, 2)
+      pred_traj_rel  (T_pred, B, 2)
+      non_linear_ped (B,)
+      loss_mask      (B, T_obs+T_pred)
+      seq_start_end  (B, 2)   — each scenario has exactly 1 ego → trivial
+      nb_feats       (T_obs, B, K, F)
+      nb_mask        (B, K)
+    """
+    (obs_list, pred_list, obs_rel_list, pred_rel_list,
+     nl_list, nb_feats_list, nb_mask_list, loss_mask_list) = zip(*data)
+
+    B = len(obs_list)
+    seq_start_end = torch.LongTensor([[i, i + 1] for i in range(B)])
+
+    obs_traj      = torch.stack(obs_list,      dim=0).permute(1, 0, 2)   # (T, B, 2)
+    pred_traj     = torch.stack(pred_list,     dim=0).permute(1, 0, 2)   # (Tf, B, 2)
+    obs_traj_rel  = torch.stack(obs_rel_list,  dim=0).permute(1, 0, 2)
+    pred_traj_rel = torch.stack(pred_rel_list, dim=0).permute(1, 0, 2)
+    non_linear    = torch.stack(nl_list,       dim=0)                    # (B,)
+    loss_mask     = torch.stack(loss_mask_list, dim=0)                   # (B, T+Tf)
+    nb_feats      = torch.stack(nb_feats_list,  dim=0).permute(1, 0, 2, 3)  # (T, B, K, F)
+    nb_mask       = torch.stack(nb_mask_list,   dim=0)                   # (B, K)
+
+    return (obs_traj, pred_traj, obs_traj_rel, pred_traj_rel,
+            non_linear, loss_mask, seq_start_end,
+            nb_feats, nb_mask)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Original ETH/UCY dataset
+# ─────────────────────────────────────────────────────────────────────────────
 
 def seq_collate(data):
     (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,

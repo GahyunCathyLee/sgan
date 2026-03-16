@@ -351,18 +351,116 @@ class SocialPooling(nn.Module):
         return pool_h
 
 
+class HighDPoolNet(nn.Module):
+    """
+    Pooling module for HighD data using precomputed neighbor features.
+
+    Instead of computing pairwise relative positions between agents
+    (as PoolHiddenNet does), this module reads pre-extracted neighbor
+    features [dx, dy, dvx, dvy, dax, day (, I)] and aggregates them
+    into a social context vector for the ego vehicle.
+
+    Forward inputs
+    --------------
+    h_states : (num_layers, batch, encoder_h_dim)
+    nb_feats : (obs_len, batch, K, nb_feat_dim)
+    nb_mask  : (batch, K) bool  — True if slot is occupied
+
+    Output
+    ------
+    pool_h : (batch, bottleneck_dim)
+    """
+
+    def __init__(
+        self, encoder_h_dim=64, nb_feat_dim=6, K=8,
+        mlp_dim=1024, bottleneck_dim=1024,
+        activation='relu', batch_norm=True, dropout=0.0
+    ):
+        super(HighDPoolNet, self).__init__()
+
+        self.encoder_h_dim  = encoder_h_dim
+        self.nb_feat_dim    = nb_feat_dim
+        self.K              = K
+        self.bottleneck_dim = bottleneck_dim
+
+        # Per-neighbor feature encoder: nb_feat_dim → encoder_h_dim
+        nb_enc_dims = [nb_feat_dim, mlp_dim // 2, encoder_h_dim]
+        self.nb_encoder = make_mlp(
+            nb_enc_dims,
+            activation=activation,
+            batch_norm=batch_norm,
+            dropout=dropout,
+        )
+
+        # Combine ego hidden + pooled neighbor context → bottleneck
+        pool_mlp_dims = [encoder_h_dim + encoder_h_dim, mlp_dim, bottleneck_dim]
+        self.pool_mlp = make_mlp(
+            pool_mlp_dims,
+            activation=activation,
+            batch_norm=batch_norm,
+            dropout=dropout,
+        )
+
+    def forward(self, h_states, nb_feats, nb_mask):
+        """
+        h_states : (num_layers, batch, encoder_h_dim)
+        nb_feats : (obs_len, batch, K, nb_feat_dim)
+        nb_mask  : (batch, K) bool
+        """
+        batch = h_states.size(1)
+        K     = nb_feats.size(2)
+
+        # Use last-timestep neighbor features: (batch, K, nb_feat_dim)
+        last_nb = nb_feats[-1]
+
+        # Encode each neighbor independently
+        last_nb_flat  = last_nb.contiguous().view(batch * K, self.nb_feat_dim)
+        nb_encoded    = self.nb_encoder(last_nb_flat)           # (B*K, enc_h)
+        nb_encoded    = nb_encoded.view(batch, K, self.encoder_h_dim)
+
+        # Zero out absent neighbor slots
+        mask = nb_mask.float().unsqueeze(-1)                    # (B, K, 1)
+        nb_encoded = nb_encoded * mask                          # (B, K, enc_h)
+
+        # Max-pool over K neighbors → (batch, encoder_h_dim)
+        # Slots that are masked are 0; max over 0-vectors is 0 if all absent.
+        nb_pooled = nb_encoded.max(dim=1)[0]                   # (B, enc_h)
+
+        # Concatenate with ego hidden state
+        ego_h    = h_states.view(-1, self.encoder_h_dim)        # (B, enc_h)
+        combined = torch.cat([ego_h, nb_pooled], dim=1)         # (B, 2*enc_h)
+
+        pool_h = self.pool_mlp(combined)                        # (B, bottleneck)
+        return pool_h
+
+
 class TrajectoryGenerator(nn.Module):
     def __init__(
         self, obs_len, pred_len, embedding_dim=64, encoder_h_dim=64,
         decoder_h_dim=128, mlp_dim=1024, num_layers=1, noise_dim=(0, ),
         noise_type='gaussian', noise_mix_type='ped', pooling_type=None,
         pool_every_timestep=True, dropout=0.0, bottleneck_dim=1024,
-        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8
+        activation='relu', batch_norm=True, neighborhood_size=2.0, grid_size=8,
+        nb_feat_dim=6, nb_K=8
     ):
+        """
+        Additional args for HighD pooling
+        ----------------------------------
+        nb_feat_dim : int  — neighbor feature dimension (6 without I, 7 with I)
+        nb_K        : int  — number of neighbor slots (default 8)
+
+        Set pooling_type='highd_pool' to activate HighDPoolNet.
+        When highd_pool is used, pool_every_timestep is forced to False
+        (neighbor features are only pooled at the encoder stage).
+        """
         super(TrajectoryGenerator, self).__init__()
 
         if pooling_type and pooling_type.lower() == 'none':
             pooling_type = None
+
+        # highd_pool does not support per-timestep pooling in the decoder
+        if pooling_type == 'highd_pool':
+            pool_every_timestep = False
 
         self.obs_len = obs_len
         self.pred_len = pred_len
@@ -387,6 +485,9 @@ class TrajectoryGenerator(nn.Module):
             dropout=dropout
         )
 
+        # The decoder uses the original pooling types (pool_net / spool).
+        # For highd_pool the decoder sees pooling_type=None (no per-step pool).
+        decoder_pooling_type = pooling_type if pooling_type != 'highd_pool' else None
         self.decoder = Decoder(
             pred_len,
             embedding_dim=embedding_dim,
@@ -398,7 +499,7 @@ class TrajectoryGenerator(nn.Module):
             bottleneck_dim=bottleneck_dim,
             activation=activation,
             batch_norm=batch_norm,
-            pooling_type=pooling_type,
+            pooling_type=decoder_pooling_type,
             grid_size=grid_size,
             neighborhood_size=neighborhood_size
         )
@@ -420,6 +521,17 @@ class TrajectoryGenerator(nn.Module):
                 dropout=dropout,
                 neighborhood_size=neighborhood_size,
                 grid_size=grid_size
+            )
+        elif pooling_type == 'highd_pool':
+            self.pool_net = HighDPoolNet(
+                encoder_h_dim=encoder_h_dim,
+                nb_feat_dim=nb_feat_dim,
+                K=nb_K,
+                mlp_dim=mlp_dim,
+                bottleneck_dim=bottleneck_dim,
+                activation=activation,
+                batch_norm=batch_norm,
+                dropout=dropout,
             )
 
         if self.noise_dim[0] == 0:
@@ -492,12 +604,16 @@ class TrajectoryGenerator(nn.Module):
         else:
             return False
 
-    def forward(self, obs_traj, obs_traj_rel, seq_start_end, user_noise=None):
+    def forward(self, obs_traj, obs_traj_rel, seq_start_end,
+                nb_feats=None, nb_mask=None, user_noise=None):
         """
         Inputs:
         - obs_traj: Tensor of shape (obs_len, batch, 2)
         - obs_traj_rel: Tensor of shape (obs_len, batch, 2)
         - seq_start_end: A list of tuples which delimit sequences within batch.
+        - nb_feats: (obs_len, batch, K, nb_feat_dim) — HighD neighbor features
+                    Required when pooling_type='highd_pool', ignored otherwise.
+        - nb_mask:  (batch, K) bool — neighbor existence mask for highd_pool.
         - user_noise: Generally used for inference when you want to see
         relation between different types of noise and outputs.
         Output:
@@ -507,7 +623,12 @@ class TrajectoryGenerator(nn.Module):
         # Encode seq
         final_encoder_h = self.encoder(obs_traj_rel)
         # Pool States
-        if self.pooling_type:
+        if self.pooling_type == 'highd_pool':
+            # nb_feats: (T, B, K, F), nb_mask: (B, K)
+            pool_h = self.pool_net(final_encoder_h, nb_feats, nb_mask)
+            mlp_decoder_context_input = torch.cat(
+                [final_encoder_h.view(-1, self.encoder_h_dim), pool_h], dim=1)
+        elif self.pooling_type:
             end_pos = obs_traj[-1, :, :]
             pool_h = self.pool_net(final_encoder_h, seq_start_end, end_pos)
             # Construct input hidden states for decoder

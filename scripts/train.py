@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from sgan.data.loader import data_loader
+from sgan.data.loader import data_loader, highd_data_loader
 from sgan.losses import gan_g_loss, gan_d_loss, l2_loss
 from sgan.losses import displacement_error, final_displacement_error
 
@@ -92,6 +92,20 @@ parser.add_argument('--use_gpu', default=1, type=int)
 parser.add_argument('--timing', default=0, type=int)
 parser.add_argument('--gpu_num', default="0", type=str)
 
+# HighD dataset options
+parser.add_argument('--use_highd', default=0, type=bool_flag,
+                    help='Use HighD mmap dataset instead of ETH/UCY text files.')
+parser.add_argument('--highd_mmap_path', default='data/highD/mmap', type=str,
+                    help='Path to the mmap directory produced by preprocess.py.')
+parser.add_argument('--highd_val_path', default='', type=str,
+                    help='Separate mmap directory for validation. '
+                         'If empty, highd_val_ratio is used to split highd_mmap_path.')
+parser.add_argument('--highd_val_ratio', default=0.1, type=float,
+                    help='Fraction of recordings to use as validation '
+                         '(only when --highd_val_path is not set).')
+parser.add_argument('--use_I', default=0, type=bool_flag,
+                    help='Append composite importance score I to neighbor features.')
+
 
 def init_weights(m):
     classname = m.__class__.__name__
@@ -110,15 +124,41 @@ def get_dtypes(args):
 
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_num
-    train_path = get_dset_path(args.dataset_name, 'train')
-    val_path = get_dset_path(args.dataset_name, 'val')
 
     long_dtype, float_dtype = get_dtypes(args)
 
-    logger.info("Initializing train dataset")
-    train_dset, train_loader = data_loader(args, train_path)
-    logger.info("Initializing val dataset")
-    _, val_loader = data_loader(args, val_path)
+    if args.use_highd:
+        logger.info("Initializing HighD train dataset from %s", args.highd_mmap_path)
+        train_dset, train_loader = highd_data_loader(
+            args, args.highd_mmap_path, split='train')
+        logger.info("Initializing HighD val dataset")
+        _, val_loader = highd_data_loader(
+            args, args.highd_mmap_path, split='val')
+
+        # Derive obs_len / pred_len from the mmap if not explicitly set
+        # (HighDDataset validates that the requested dims match the mmap)
+        import numpy as np
+        from pathlib import Path
+        _x = np.load(str(Path(args.highd_mmap_path) / 'x_ego.npy'), mmap_mode='r')
+        _y = np.load(str(Path(args.highd_mmap_path) / 'y.npy'),     mmap_mode='r')
+        args.obs_len  = _x.shape[1]
+        args.pred_len = _y.shape[1]
+        logger.info("HighD mmap: obs_len=%d  pred_len=%d", args.obs_len, args.pred_len)
+
+        # Recommend highd_pool when the user hasn't changed pooling_type
+        if args.pooling_type == 'pool_net':
+            logger.warning(
+                "Using --pooling_type pool_net with HighD data provides no "
+                "social context (only 1 ego per scene). "
+                "Consider --pooling_type highd_pool to use neighbor features."
+            )
+    else:
+        train_path = get_dset_path(args.dataset_name, 'train')
+        val_path   = get_dset_path(args.dataset_name, 'val')
+        logger.info("Initializing train dataset")
+        train_dset, train_loader = data_loader(args, train_path)
+        logger.info("Initializing val dataset")
+        _, val_loader = data_loader(args, val_path)
 
     iterations_per_epoch = len(train_dset) / args.batch_size / args.d_steps
     if args.num_epochs:
@@ -127,6 +167,9 @@ def main(args):
     logger.info(
         'There are {} iterations per epoch'.format(iterations_per_epoch)
     )
+
+    # nb_feat_dim: 6 base features + 1 if I is included
+    nb_feat_dim = 7 if getattr(args, 'use_I', False) else 6
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,
@@ -145,7 +188,9 @@ def main(args):
         bottleneck_dim=args.bottleneck_dim,
         neighborhood_size=args.neighborhood_size,
         grid_size=args.grid_size,
-        batch_norm=args.batch_norm)
+        batch_norm=args.batch_norm,
+        nb_feat_dim=nb_feat_dim,
+        nb_K=8)
 
     generator.apply(init_weights)
     generator.type(float_dtype).train()
@@ -359,16 +404,45 @@ def main(args):
                 break
 
 
+def _unpack_batch(args, batch):
+    """
+    Unpack a batch from either the original collate or seq_collate_highd.
+
+    Returns
+    -------
+    obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+    non_linear_ped, loss_mask, seq_start_end,
+    nb_feats (or None), nb_mask (or None)
+    """
+    batch = [tensor.cuda() for tensor in batch]
+    if args.use_highd:
+        (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+         non_linear_ped, loss_mask, seq_start_end,
+         nb_feats, nb_mask) = batch
+    else:
+        (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+         non_linear_ped, loss_mask, seq_start_end) = batch
+        nb_feats = nb_mask = None
+    return (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+            non_linear_ped, loss_mask, seq_start_end, nb_feats, nb_mask)
+
+
+def _generator_forward(args, generator, obs_traj, obs_traj_rel,
+                        seq_start_end, nb_feats=None, nb_mask=None):
+    return generator(obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask)
+
+
 def discriminator_step(
     args, batch, generator, discriminator, d_loss_fn, optimizer_d
 ):
-    batch = [tensor.cuda() for tensor in batch]
-    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped,
-     loss_mask, seq_start_end) = batch
+    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+     non_linear_ped, loss_mask, seq_start_end,
+     nb_feats, nb_mask) = _unpack_batch(args, batch)
     losses = {}
     loss = torch.zeros(1).to(pred_traj_gt)
 
-    generator_out = generator(obs_traj, obs_traj_rel, seq_start_end)
+    generator_out = _generator_forward(
+        args, generator, obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask)
 
     pred_traj_fake_rel = generator_out
     pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
@@ -400,9 +474,9 @@ def discriminator_step(
 def generator_step(
     args, batch, generator, discriminator, g_loss_fn, optimizer_g
 ):
-    batch = [tensor.cuda() for tensor in batch]
-    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped,
-     loss_mask, seq_start_end) = batch
+    (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
+     non_linear_ped, loss_mask, seq_start_end,
+     nb_feats, nb_mask) = _unpack_batch(args, batch)
     losses = {}
     loss = torch.zeros(1).to(pred_traj_gt)
     g_l2_loss_rel = []
@@ -410,7 +484,8 @@ def generator_step(
     loss_mask = loss_mask[:, args.obs_len:]
 
     for _ in range(args.best_k):
-        generator_out = generator(obs_traj, obs_traj_rel, seq_start_end)
+        generator_out = _generator_forward(
+            args, generator, obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask)
 
         pred_traj_fake_rel = generator_out
         pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
@@ -468,15 +543,15 @@ def check_accuracy(
     generator.eval()
     with torch.no_grad():
         for batch in loader:
-            batch = [tensor.cuda() for tensor in batch]
             (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
-             non_linear_ped, loss_mask, seq_start_end) = batch
+             non_linear_ped, loss_mask, seq_start_end,
+             nb_feats, nb_mask) = _unpack_batch(args, batch)
             linear_ped = 1 - non_linear_ped
             loss_mask = loss_mask[:, args.obs_len:]
 
-            pred_traj_fake_rel = generator(
-                obs_traj, obs_traj_rel, seq_start_end
-            )
+            pred_traj_fake_rel = _generator_forward(
+                args, generator, obs_traj, obs_traj_rel, seq_start_end,
+                nb_feats, nb_mask)
             pred_traj_fake = relative_to_abs(pred_traj_fake_rel, obs_traj[-1])
 
             g_l2_loss_abs, g_l2_loss_rel = cal_l2_losses(

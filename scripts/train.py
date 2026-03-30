@@ -3,9 +3,10 @@ import gc
 import logging
 import os
 import sys
-import time
 
 from collections import defaultdict
+
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -35,7 +36,7 @@ parser.add_argument('--pred_len', default=8, type=int)
 parser.add_argument('--skip', default=1, type=int)
 
 # Optimization
-parser.add_argument('--batch_size', default=64, type=int)
+parser.add_argument('--batch_size', default=256, type=int)
 parser.add_argument('--num_iterations', default=10000, type=int)
 parser.add_argument('--num_epochs', default=200, type=int)
 
@@ -53,7 +54,7 @@ parser.add_argument('--noise_dim', default=None, type=int_tuple)
 parser.add_argument('--noise_type', default='gaussian')
 parser.add_argument('--noise_mix_type', default='ped')
 parser.add_argument('--clipping_threshold_g', default=0, type=float)
-parser.add_argument('--g_learning_rate', default=5e-4, type=float)
+parser.add_argument('--g_learning_rate', default=1e-4, type=float)
 parser.add_argument('--g_steps', default=1, type=int)
 
 # Pooling Options
@@ -70,19 +71,19 @@ parser.add_argument('--grid_size', default=8, type=int)
 # Discriminator Options
 parser.add_argument('--d_type', default='local', type=str)
 parser.add_argument('--encoder_h_dim_d', default=64, type=int)
-parser.add_argument('--d_learning_rate', default=5e-4, type=float)
+parser.add_argument('--d_learning_rate', default=1e-4, type=float)
 parser.add_argument('--d_steps', default=2, type=int)
 parser.add_argument('--clipping_threshold_d', default=0, type=float)
 
 # Loss Options
-parser.add_argument('--l2_loss_weight', default=0, type=float)
-parser.add_argument('--best_k', default=1, type=int)
+parser.add_argument('--l2_loss_weight', default=1.0, type=float)
+parser.add_argument('--best_k', default=6, type=int)
 
 # Output
-parser.add_argument('--output_dir', default=os.getcwd())
+parser.add_argument('--output_dir', default='ckpts')
 parser.add_argument('--print_every', default=5, type=int)
 parser.add_argument('--checkpoint_every', default=100, type=int)
-parser.add_argument('--checkpoint_name', default='checkpoint')
+parser.add_argument('--checkpoint_name', default='baseline')
 parser.add_argument('--checkpoint_start_from', default=None)
 parser.add_argument('--restore_from_checkpoint', default=1, type=int)
 parser.add_argument('--num_samples_check', default=5000, type=int)
@@ -97,14 +98,19 @@ parser.add_argument('--use_highd', default=0, type=bool_flag,
                     help='Use HighD mmap dataset instead of ETH/UCY text files.')
 parser.add_argument('--highd_mmap_path', default='data/highD/mmap', type=str,
                     help='Path to the mmap directory produced by preprocess.py.')
-parser.add_argument('--highd_val_path', default='', type=str,
-                    help='Separate mmap directory for validation. '
-                         'If empty, highd_val_ratio is used to split highd_mmap_path.')
+parser.add_argument('--highd_split_dir', default='', type=str,
+                    help='Directory containing train/val/test_indices.npy produced by split.py. '
+                         'When set, pre-computed splits are used instead of highd_val_ratio.')
 parser.add_argument('--highd_val_ratio', default=0.1, type=float,
                     help='Fraction of recordings to use as validation '
-                         '(only when --highd_val_path is not set).')
+                         '(only when --highd_split_dir is not set).')
 parser.add_argument('--use_I', default=0, type=bool_flag,
-                    help='Append composite importance score I to neighbor features.')
+                    help='Append composite importance score I (idx 12) to neighbor features.')
+parser.add_argument('--use_Iy', default=0, type=bool_flag,
+                    help='Append lateral importance I_y (idx 11) to neighbor features. '
+                         'Corresponds to condition c2. Takes precedence over --use_I.')
+parser.add_argument('--seed', default=None, type=int,
+                    help='Global random seed for reproducibility.')
 
 
 def init_weights(m):
@@ -123,20 +129,26 @@ def get_dtypes(args):
 
 
 def main(args):
+    if args.seed is not None:
+        import random
+        import numpy as np
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        logger.info("Global seed set to %d", args.seed)
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_num
 
     long_dtype, float_dtype = get_dtypes(args)
 
     if args.use_highd:
-        logger.info("Initializing HighD train dataset from %s", args.highd_mmap_path)
-        train_dset, train_loader = highd_data_loader(
-            args, args.highd_mmap_path, split='train')
-        logger.info("Initializing HighD val dataset")
-        _, val_loader = highd_data_loader(
-            args, args.highd_mmap_path, split='val')
+        if args.highd_split_dir:
+            logger.info("Using pre-computed splits from %s", args.highd_split_dir)
 
-        # Derive obs_len / pred_len from the mmap if not explicitly set
-        # (HighDDataset validates that the requested dims match the mmap)
+        # Derive obs_len / pred_len from the mmap before constructing datasets
         import numpy as np
         from pathlib import Path
         _x = np.load(str(Path(args.highd_mmap_path) / 'x_ego.npy'), mmap_mode='r')
@@ -144,6 +156,13 @@ def main(args):
         args.obs_len  = _x.shape[1]
         args.pred_len = _y.shape[1]
         logger.info("HighD mmap: obs_len=%d  pred_len=%d", args.obs_len, args.pred_len)
+
+        logger.info("Initializing HighD train dataset from %s", args.highd_mmap_path)
+        train_dset, train_loader = highd_data_loader(
+            args, args.highd_mmap_path, split='train')
+        logger.info("Initializing HighD val dataset")
+        _, val_loader = highd_data_loader(
+            args, args.highd_mmap_path, split='val')
 
         # Recommend highd_pool when the user hasn't changed pooling_type
         if args.pooling_type == 'pool_net':
@@ -168,8 +187,8 @@ def main(args):
         'There are {} iterations per epoch'.format(iterations_per_epoch)
     )
 
-    # nb_feat_dim: 6 base features + 1 if I is included
-    nb_feat_dim = 7 if getattr(args, 'use_I', False) else 6
+    # nb_feat_dim: 6 base features + 1 if any importance feature is included
+    nb_feat_dim = 7 if (getattr(args, 'use_I', False) or getattr(args, 'use_Iy', False)) else 6
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,
@@ -194,8 +213,6 @@ def main(args):
 
     generator.apply(init_weights)
     generator.type(float_dtype).train()
-    logger.info('Here is the generator:')
-    logger.info(generator)
 
     discriminator = TrajectoryDiscriminator(
         obs_len=args.obs_len,
@@ -210,8 +227,6 @@ def main(args):
 
     discriminator.apply(init_weights)
     discriminator.type(float_dtype).train()
-    logger.info('Here is the discriminator:')
-    logger.info(discriminator)
 
     g_loss_fn = gan_g_loss
     d_loss_fn = gan_d_loss
@@ -231,7 +246,7 @@ def main(args):
 
     if restore_path is not None and os.path.isfile(restore_path):
         logger.info('Restoring from checkpoint {}'.format(restore_path))
-        checkpoint = torch.load(restore_path)
+        checkpoint = torch.load(restore_path, weights_only=False)
         generator.load_state_dict(checkpoint['g_state'])
         discriminator.load_state_dict(checkpoint['d_state'])
         optimizer_g.load_state_dict(checkpoint['g_optim_state'])
@@ -268,23 +283,33 @@ def main(args):
             'd_best_state_nl': None,
             'best_t_nl': None,
         }
-    t0 = None
-    while t < args.num_iterations:
+    os.makedirs(args.output_dir, exist_ok=True)
+    start_epoch  = epoch
+    end_epoch    = start_epoch + args.num_epochs
+    best_ade     = float('inf')
+    best_path    = os.path.join(args.output_dir, '%s_best.pt' % args.checkpoint_name)
+    last_path    = os.path.join(args.output_dir, '%s_with_model.pt' % args.checkpoint_name)
+
+    print(f'\n====== Train ======')
+    print(f'  Epochs={args.num_epochs}  bs={args.batch_size}'
+          f'  lr_g={args.g_learning_rate}  lr_d={args.d_learning_rate}'
+          f'  ckpt={args.output_dir}')
+
+    for ep in range(start_epoch + 1, end_epoch + 1):
         gc.collect()
+        rel_ep = ep - start_epoch
+        print(f'\n====== Epoch {rel_ep}/{args.num_epochs} ======')
+
+        d_losses_ep, g_losses_ep = [], []
         d_steps_left = args.d_steps
         g_steps_left = args.g_steps
-        epoch += 1
-        logger.info('Starting epoch {}'.format(epoch))
-        for batch in train_loader:
-            if args.timing == 1:
-                torch.cuda.synchronize()
-                t1 = time.time()
+        losses_d = losses_g = {}
+        steps_per_iter = args.d_steps + args.g_steps
+        iters_per_epoch = len(train_loader) // steps_per_iter
 
-            # Decide whether to use the batch for stepping on discriminator or
-            # generator; an iteration consists of args.d_steps steps on the
-            # discriminator followed by args.g_steps steps on the generator.
+        pbar = tqdm(total=iters_per_epoch, desc='  train', leave=True, ncols=100)
+        for batch in train_loader:
             if d_steps_left > 0:
-                step_type = 'd'
                 losses_d = discriminator_step(args, batch, generator,
                                               discriminator, d_loss_fn,
                                               optimizer_d)
@@ -292,116 +317,73 @@ def main(args):
                     get_total_norm(discriminator.parameters()))
                 d_steps_left -= 1
             elif g_steps_left > 0:
-                step_type = 'g'
                 losses_g = generator_step(args, batch, generator,
                                           discriminator, g_loss_fn,
                                           optimizer_g)
                 checkpoint['norm_g'].append(
-                    get_total_norm(generator.parameters())
-                )
+                    get_total_norm(generator.parameters()))
                 g_steps_left -= 1
 
-            if args.timing == 1:
-                torch.cuda.synchronize()
-                t2 = time.time()
-                logger.info('{} step took {}'.format(step_type, t2 - t1))
-
-            # Skip the rest if we are not at the end of an iteration
             if d_steps_left > 0 or g_steps_left > 0:
                 continue
 
-            if args.timing == 1:
-                if t0 is not None:
-                    logger.info('Interation {} took {}'.format(
-                        t - 1, time.time() - t0
-                    ))
-                t0 = time.time()
-
-            # Maybe save loss
-            if t % args.print_every == 0:
-                logger.info('t = {} / {}'.format(t + 1, args.num_iterations))
-                for k, v in sorted(losses_d.items()):
-                    logger.info('  [D] {}: {:.3f}'.format(k, v))
-                    checkpoint['D_losses'][k].append(v)
-                for k, v in sorted(losses_g.items()):
-                    logger.info('  [G] {}: {:.3f}'.format(k, v))
-                    checkpoint['G_losses'][k].append(v)
-                checkpoint['losses_ts'].append(t)
-
-            # Maybe save a checkpoint
-            if t > 0 and t % args.checkpoint_every == 0:
-                checkpoint['counters']['t'] = t
-                checkpoint['counters']['epoch'] = epoch
-                checkpoint['sample_ts'].append(t)
-
-                # Check stats on the validation set
-                logger.info('Checking stats on val ...')
-                metrics_val = check_accuracy(
-                    args, val_loader, generator, discriminator, d_loss_fn
-                )
-                logger.info('Checking stats on train ...')
-                metrics_train = check_accuracy(
-                    args, train_loader, generator, discriminator,
-                    d_loss_fn, limit=True
-                )
-
-                for k, v in sorted(metrics_val.items()):
-                    logger.info('  [val] {}: {:.3f}'.format(k, v))
-                    checkpoint['metrics_val'][k].append(v)
-                for k, v in sorted(metrics_train.items()):
-                    logger.info('  [train] {}: {:.3f}'.format(k, v))
-                    checkpoint['metrics_train'][k].append(v)
-
-                min_ade = min(checkpoint['metrics_val']['ade'])
-                min_ade_nl = min(checkpoint['metrics_val']['ade_nl'])
-
-                if metrics_val['ade'] == min_ade:
-                    logger.info('New low for avg_disp_error')
-                    checkpoint['best_t'] = t
-                    checkpoint['g_best_state'] = generator.state_dict()
-                    checkpoint['d_best_state'] = discriminator.state_dict()
-
-                if metrics_val['ade_nl'] == min_ade_nl:
-                    logger.info('New low for avg_disp_error_nl')
-                    checkpoint['best_t_nl'] = t
-                    checkpoint['g_best_nl_state'] = generator.state_dict()
-                    checkpoint['d_best_nl_state'] = discriminator.state_dict()
-
-                # Save another checkpoint with model weights and
-                # optimizer state
-                checkpoint['g_state'] = generator.state_dict()
-                checkpoint['g_optim_state'] = optimizer_g.state_dict()
-                checkpoint['d_state'] = discriminator.state_dict()
-                checkpoint['d_optim_state'] = optimizer_d.state_dict()
-                checkpoint_path = os.path.join(
-                    args.output_dir, '%s_with_model.pt' % args.checkpoint_name
-                )
-                logger.info('Saving checkpoint to {}'.format(checkpoint_path))
-                torch.save(checkpoint, checkpoint_path)
-                logger.info('Done.')
-
-                # Save a checkpoint with no model weights by making a shallow
-                # copy of the checkpoint excluding some items
-                checkpoint_path = os.path.join(
-                    args.output_dir, '%s_no_model.pt' % args.checkpoint_name)
-                logger.info('Saving checkpoint to {}'.format(checkpoint_path))
-                key_blacklist = [
-                    'g_state', 'd_state', 'g_best_state', 'g_best_nl_state',
-                    'g_optim_state', 'd_optim_state', 'd_best_state',
-                    'd_best_nl_state'
-                ]
-                small_checkpoint = {}
-                for k, v in checkpoint.items():
-                    if k not in key_blacklist:
-                        small_checkpoint[k] = v
-                torch.save(small_checkpoint, checkpoint_path)
-                logger.info('Done.')
+            # full iteration complete
+            d_losses_ep.append(losses_d.get('D_total_loss', 0.0))
+            g_losses_ep.append(losses_g.get('G_total_loss', 0.0))
+            for k, v in losses_d.items():
+                checkpoint['D_losses'][k].append(v)
+            for k, v in losses_g.items():
+                checkpoint['G_losses'][k].append(v)
 
             t += 1
             d_steps_left = args.d_steps
             g_steps_left = args.g_steps
-            if t >= args.num_iterations:
-                break
+            pbar.set_postfix(
+                D=f"{losses_d.get('D_total_loss', 0):.3f}",
+                G=f"{losses_g.get('G_total_loss', 0):.3f}",
+            )
+            pbar.update(1)
+
+        pbar.close()
+        avg_d = sum(d_losses_ep) / len(d_losses_ep) if d_losses_ep else 0.0
+        avg_g = sum(g_losses_ep) / len(g_losses_ep) if g_losses_ep else 0.0
+
+        # Validation
+        metrics_val = check_accuracy(
+            args, val_loader, generator, discriminator, d_loss_fn
+        )
+        for k, v in metrics_val.items():
+            checkpoint['metrics_val'][k].append(v)
+
+        print(
+            f'  D_loss={avg_d:.4f}  G_loss={avg_g:.4f} | '
+            f'Val ADE={metrics_val["ade"]:.3f}  FDE={metrics_val["fde"]:.3f}'
+        )
+
+        # Save checkpoint
+        checkpoint['counters']['t'] = t
+        checkpoint['counters']['epoch'] = ep
+        checkpoint['g_state'] = generator.state_dict()
+        checkpoint['g_optim_state'] = optimizer_g.state_dict()
+        checkpoint['d_state'] = discriminator.state_dict()
+        checkpoint['d_optim_state'] = optimizer_d.state_dict()
+        torch.save(checkpoint, last_path)
+
+        if metrics_val['ade'] < best_ade:
+            best_ade = metrics_val['ade']
+            checkpoint['best_t'] = t
+            checkpoint['g_best_state'] = generator.state_dict()
+            checkpoint['d_best_state'] = discriminator.state_dict()
+            torch.save(checkpoint, best_path)
+            print(f'  best ckpt saved -> {best_path}  (val_ade={best_ade:.4f})')
+
+        if ep % args.checkpoint_every == 0:
+            snap_path = os.path.join(
+                args.output_dir, '%s_ep%d.pt' % (args.checkpoint_name, ep))
+            torch.save(checkpoint, snap_path)
+            print(f'  snapshot -> {snap_path}')
+
+    print(f'\n[DONE] Training finished.  Best val_ade: {best_ade:.4f}')
 
 
 def _unpack_batch(args, batch):

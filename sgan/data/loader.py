@@ -29,37 +29,38 @@ def highd_data_loader(args, mmap_path, split='train'):
 
     Splitting strategy
     ------------------
-    If args.highd_val_path is set (non-empty), that directory is used for
-    validation and mmap_path is used as-is for training.
+    1. If args.highd_split_dir is set, load pre-computed index files from
+       that directory (train_indices.npy / val_indices.npy / test_indices.npy)
+       produced by split.py.
 
-    Otherwise the single mmap at mmap_path is split by recording ID:
-    the first ceil((1-val_ratio)*N_recs) recordings → train,
-    the remainder → val.
+    2. Otherwise, split by recording ID using highd_val_ratio.
 
     Args
     ----
     args      : namespace with obs_len, pred_len, batch_size,
-                loader_num_workers, use_I, highd_val_path, highd_val_ratio
-    mmap_path : path to the mmap directory (train mmap when split!='val',
-                or the single mmap to be split by recording)
-    split     : 'train' | 'val'
+                loader_num_workers, use_I, highd_split_dir, highd_val_ratio
+    mmap_path : path to the mmap directory
+    split     : 'train' | 'val' | 'test'
     """
     mmap_path = Path(mmap_path)
-    use_I = getattr(args, 'use_I', False)
+    use_I  = getattr(args, 'use_I',  False)
+    use_Iy = getattr(args, 'use_Iy', False)
+    actual_path = mmap_path
 
     # ── determine sample indices for this split ───────────────────────────
-    val_path = getattr(args, 'highd_val_path', '')
-    if val_path:
-        # Separate val mmap: no splitting needed
-        if split == 'val':
-            actual_path = Path(val_path)
-        else:
-            actual_path = mmap_path
-        indices = None
+    split_dir = getattr(args, 'highd_split_dir', '')
+    if split_dir:
+        # Load pre-computed indices from split.py
+        idx_file = Path(split_dir) / f'{split}_indices.npy'
+        if not idx_file.exists():
+            raise FileNotFoundError(
+                f"Split index file not found: {idx_file}\n"
+                "Run data/highD/split.py first, or check --highd_split_dir."
+            )
+        indices = np.load(str(idx_file))
     else:
         # Split the single mmap by recording ID
-        actual_path = mmap_path
-        val_ratio   = getattr(args, 'highd_val_ratio', 0.1)
+        val_ratio    = getattr(args, 'highd_val_ratio', 0.1)
         rec_ids_path = actual_path / 'meta_recordingId.npy'
         if rec_ids_path.exists():
             rec_ids = np.load(str(rec_ids_path))
@@ -85,6 +86,7 @@ def highd_data_loader(args, mmap_path, split='train'):
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         use_I=use_I,
+        use_Iy=use_Iy,
         indices=indices,
     )
 

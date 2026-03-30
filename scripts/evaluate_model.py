@@ -53,7 +53,8 @@ def rmse(pred_abs: torch.Tensor, y_abs: torch.Tensor) -> torch.Tensor:
 def get_generator(checkpoint):
     args = AttrDict(checkpoint['args'])
 
-    nb_feat_dim = args.get('nb_feat_dim', 7 if args.get('use_I', False) else 6)
+    nb_feat_dim = args.get('nb_feat_dim',
+                           7 if (args.get('use_I', False) or args.get('use_Iy', False)) else 6)
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,

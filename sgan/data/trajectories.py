@@ -16,10 +16,11 @@ logger = logging.getLogger(__name__)
 
 # x_nb feature indices (neighformer preprocess.py schema, 13 dims):
 #   dx(0) dy(1) dvx(2) dvy(3) dax(4) day(5)
-#   lc_state(6) lit(7) lis(8) gate(9) I_x(10) I_y(11) I(12)
+#   lc_state(6) volume(7) size_bin(8) gate(9) I_x(10) I_y(11) I(12)
 _NB_BASE_INDICES = [0, 1, 2, 3, 4, 5]
-_NB_IY_INDEX = 11   # lateral importance
-_NB_I_INDEX  = 12   # composite importance
+_NB_DIM_INDEX = 8    # vehicle size bin (0~4)
+_NB_IY_INDEX  = 11   # lateral importance
+_NB_I_INDEX   = 12   # composite importance
 
 
 class HighDDataset(Dataset):
@@ -43,7 +44,7 @@ class HighDDataset(Dataset):
     """
 
     def __init__(self, mmap_path, obs_len=None, pred_len=None,
-                 use_I=False, use_Iy=False, indices=None, threshold=0.002):
+                 use_I=False, use_Iy=False, use_dim=False, indices=None, threshold=0.002):
         super().__init__()
         mmap_path = Path(mmap_path)
 
@@ -69,13 +70,15 @@ class HighDDataset(Dataset):
 
         self.use_I     = use_I
         self.use_Iy    = use_Iy
+        self.use_dim   = use_dim
         self.threshold = threshold
+        extra = []
+        if use_dim:
+            extra.append(_NB_DIM_INDEX)
         if use_Iy:
-            extra = [_NB_IY_INDEX]
+            extra.append(_NB_IY_INDEX)
         elif use_I:
-            extra = [_NB_I_INDEX]
-        else:
-            extra = []
+            extra.append(_NB_I_INDEX)
         self.nb_feat_indices = _NB_BASE_INDICES + extra
 
         N = self.x_ego.shape[0]

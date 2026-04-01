@@ -43,8 +43,9 @@ def highd_data_loader(args, mmap_path, split='train'):
     split     : 'train' | 'val' | 'test'
     """
     mmap_path = Path(mmap_path)
-    use_I  = getattr(args, 'use_I',  False)
-    use_Iy = getattr(args, 'use_Iy', False)
+    use_I   = getattr(args, 'use_I',   False)
+    use_Iy  = getattr(args, 'use_Iy',  False)
+    use_dim = getattr(args, 'use_dim', False)
     actual_path = mmap_path
 
     # ── determine sample indices for this split ───────────────────────────
@@ -87,6 +88,7 @@ def highd_data_loader(args, mmap_path, split='train'):
         pred_len=args.pred_len,
         use_I=use_I,
         use_Iy=use_Iy,
+        use_dim=use_dim,
         indices=indices,
     )
 

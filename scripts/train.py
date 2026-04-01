@@ -109,6 +109,8 @@ parser.add_argument('--use_I', default=0, type=bool_flag,
 parser.add_argument('--use_Iy', default=0, type=bool_flag,
                     help='Append lateral importance I_y (idx 11) to neighbor features. '
                          'Corresponds to condition c2. Takes precedence over --use_I.')
+parser.add_argument('--use_dim', default=0, type=bool_flag,
+                    help='Append vehicle size bin (idx 8) to neighbor features.')
 parser.add_argument('--seed', default=None, type=int,
                     help='Global random seed for reproducibility.')
 
@@ -187,8 +189,10 @@ def main(args):
         'There are {} iterations per epoch'.format(iterations_per_epoch)
     )
 
-    # nb_feat_dim: 6 base features + 1 if any importance feature is included
-    nb_feat_dim = 7 if (getattr(args, 'use_I', False) or getattr(args, 'use_Iy', False)) else 6
+    # nb_feat_dim: 6 base + 1 if use_dim + 1 if any importance feature
+    nb_feat_dim = (6
+                   + (1 if getattr(args, 'use_dim', False) else 0)
+                   + (1 if (getattr(args, 'use_I', False) or getattr(args, 'use_Iy', False)) else 0))
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,

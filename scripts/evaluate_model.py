@@ -17,7 +17,10 @@ from sgan.utils import relative_to_abs, get_dset_path, bool_flag
 # ─────────────────────────────────────
 class AttrDict(dict):
     def __getattr__(self, name):
-        return self[name]
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
     def __setattr__(self, name, value):
         self[name] = value
 

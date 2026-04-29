@@ -19,6 +19,7 @@ from sgan.losses import displacement_error, final_displacement_error
 from sgan.models import TrajectoryGenerator, TrajectoryDiscriminator
 from sgan.utils import int_tuple, bool_flag, get_total_norm
 from sgan.utils import relative_to_abs, get_dset_path
+from sgan.data.trajectories import highd_nb_feat_dim
 
 torch.backends.cudnn.benchmark = True
 
@@ -104,13 +105,15 @@ parser.add_argument('--highd_split_dir', default='', type=str,
 parser.add_argument('--highd_val_ratio', default=0.1, type=float,
                     help='Fraction of recordings to use as validation '
                          '(only when --highd_split_dir is not set).')
+parser.add_argument('--feature_mode', default=None,
+                    choices=['baseline', 'dimI'],
+                    help='HighD neighbor feature mode: baseline=[0:6], dimI=[0:6]+dim(8)+I(9).')
 parser.add_argument('--use_I', default=0, type=bool_flag,
-                    help='Append composite importance score I (idx 12) to neighbor features.')
+                    help=argparse.SUPPRESS)
 parser.add_argument('--use_Iy', default=0, type=bool_flag,
-                    help='Append lateral importance I_y (idx 11) to neighbor features. '
-                         'Corresponds to condition c2. Takes precedence over --use_I.')
+                    help=argparse.SUPPRESS)
 parser.add_argument('--use_dim', default=0, type=bool_flag,
-                    help='Append vehicle size bin (idx 8) to neighbor features.')
+                    help=argparse.SUPPRESS)
 parser.add_argument('--seed', default=None, type=int,
                     help='Global random seed for reproducibility.')
 
@@ -145,6 +148,12 @@ def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_num
 
     long_dtype, float_dtype = get_dtypes(args)
+
+    if args.feature_mode is None:
+        if args.use_dim and args.use_I:
+            args.feature_mode = 'dimI'
+        elif not args.use_dim and not args.use_I and not args.use_Iy:
+            args.feature_mode = 'baseline'
 
     if args.use_highd:
         if args.highd_split_dir:
@@ -189,10 +198,15 @@ def main(args):
         'There are {} iterations per epoch'.format(iterations_per_epoch)
     )
 
-    # nb_feat_dim: 6 base + 1 if use_dim + 1 if any importance feature
-    nb_feat_dim = (6
-                   + (1 if getattr(args, 'use_dim', False) else 0)
-                   + (1 if (getattr(args, 'use_I', False) or getattr(args, 'use_Iy', False)) else 0))
+    nb_feat_dim = highd_nb_feat_dim(
+        getattr(args, 'feature_mode', None),
+        use_I=getattr(args, 'use_I', False),
+        use_Iy=getattr(args, 'use_Iy', False),
+        use_dim=getattr(args, 'use_dim', False),
+    )
+    args.nb_feat_dim = nb_feat_dim
+    logger.info("HighD feature_mode=%s  nb_feat_dim=%d",
+                getattr(args, 'feature_mode', None), nb_feat_dim)
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,

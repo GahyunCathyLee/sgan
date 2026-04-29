@@ -11,16 +11,11 @@ COMMON="--use_highd 1 \
         --num_samples 20 \
         --dset_type test"
 
-# ── c0: ego+nb(6D, no importance)  |  5 trials ──────────────────────────────
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c0_t1_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c0_t2_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c0_t3_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c0_t4_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c0_t5_best.pt
+FEATURE_MODES=(baseline dimI)
 
-# ── c2: ego+nb(6D)+I_y  |  5 trials ─────────────────────────────────────────
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c2_t1_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c2_t2_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c2_t3_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c2_t4_best.pt
-python -m scripts.evaluate_model ${COMMON} --model_path ${CKPT_DIR}/v4lit_c2_t5_best.pt
+for mode in "${FEATURE_MODES[@]}"; do
+  for trial in 1 2 3 4 5; do
+    python -m scripts.evaluate_model ${COMMON} \
+      --model_path "${CKPT_DIR}/v4lit_${mode}_t${trial}_best.pt"
+  done
+done

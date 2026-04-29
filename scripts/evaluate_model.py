@@ -7,6 +7,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from sgan.data.loader import data_loader, highd_data_loader
+from sgan.data.trajectories import highd_nb_feat_dim
 from sgan.models import TrajectoryGenerator
 from sgan.losses import displacement_error, final_displacement_error
 from sgan.utils import relative_to_abs, get_dset_path, bool_flag
@@ -144,10 +145,14 @@ def rmse(pred_abs: torch.Tensor, y_abs: torch.Tensor) -> torch.Tensor:
 def get_generator(checkpoint):
     args = AttrDict(checkpoint['args'])
 
-    nb_feat_dim = args.get('nb_feat_dim',
-                           6
-                           + (1 if args.get('use_dim', False) else 0)
-                           + (1 if (args.get('use_I', False) or args.get('use_Iy', False)) else 0))
+    nb_feat_dim = args.get('nb_feat_dim')
+    if nb_feat_dim is None:
+        nb_feat_dim = highd_nb_feat_dim(
+            args.get('feature_mode', None),
+            use_I=args.get('use_I', False),
+            use_Iy=args.get('use_Iy', False),
+            use_dim=args.get('use_dim', False),
+        )
 
     generator = TrajectoryGenerator(
         obs_len=args.obs_len,

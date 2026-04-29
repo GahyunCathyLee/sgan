@@ -357,7 +357,7 @@ class HighDPoolNet(nn.Module):
 
     Instead of computing pairwise relative positions between agents
     (as PoolHiddenNet does), this module reads pre-extracted neighbor
-    features [dx, dy, dvx, dvy, dax, day (, I)] and aggregates them
+    features [dx, dy, dvx, dvy, dax, day (, dim, I)] and aggregates them
     into a social context vector for the ego vehicle.
 
     Forward inputs
@@ -446,7 +446,7 @@ class TrajectoryGenerator(nn.Module):
         """
         Additional args for HighD pooling
         ----------------------------------
-        nb_feat_dim : int  — neighbor feature dimension (6 without I, 7 with I)
+        nb_feat_dim : int  — neighbor feature dimension (6 baseline, 8 dimI)
         nb_K        : int  — number of neighbor slots (default 8)
 
         Set pooling_type='highd_pool' to activate HighDPoolNet.

@@ -38,11 +38,13 @@ def highd_data_loader(args, mmap_path, split='train'):
     Args
     ----
     args      : namespace with obs_len, pred_len, batch_size,
-                loader_num_workers, use_I, highd_split_dir, highd_val_ratio
+                loader_num_workers, feature_mode, highd_split_dir,
+                highd_val_ratio
     mmap_path : path to the mmap directory
     split     : 'train' | 'val' | 'test'
     """
     mmap_path = Path(mmap_path)
+    feature_mode = getattr(args, 'feature_mode', None)
     use_I   = getattr(args, 'use_I',   False)
     use_Iy  = getattr(args, 'use_Iy',  False)
     use_dim = getattr(args, 'use_dim', False)
@@ -86,6 +88,7 @@ def highd_data_loader(args, mmap_path, split='train'):
         actual_path,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
+        feature_mode=feature_mode,
         use_I=use_I,
         use_Iy=use_Iy,
         use_dim=use_dim,

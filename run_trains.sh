@@ -21,16 +21,22 @@ COMMON="--use_highd 1 \
         --restore_from_checkpoint 0 \
         --output_dir ckpts"
 
-# ── c0: ego+nb(6D, no importance)  |  5 trials ──────────────────────────────
-python -m scripts.train ${COMMON} --use_Iy 0 --use_I 0 --seed 42   --checkpoint_name v4lit_c0_t1
-python -m scripts.train${COMMON} --use_Iy 0 --use_I 0 --seed 1234 --checkpoint_name v4lit_c0_t2
-python -m scripts.train ${COMMON} --use_Iy 0 --use_I 0 --seed 3407 --checkpoint_name v4lit_c0_t3
-python -m scripts.train ${COMMON} --use_Iy 0 --use_I 0 --seed 0    --checkpoint_name v4lit_c0_t4
-python -m scripts.train ${COMMON} --use_Iy 0 --use_I 0 --seed 777  --checkpoint_name v4lit_c0_t5
+SEEDS=(42 1234 3407 0 777)
 
-# ── c2: ego+nb(6D)+I_y  |  5 trials ─────────────────────────────────────────
-python -m scripts.train ${COMMON} --use_Iy 1 --seed 42   --checkpoint_name v4lit_c2_t1
-python -m scripts.train ${COMMON} --use_Iy 1 --seed 1234 --checkpoint_name v4lit_c2_t2
-python -m scripts.train ${COMMON} --use_Iy 1 --seed 3407 --checkpoint_name v4lit_c2_t3
-python -m scripts.train ${COMMON} --use_Iy 1 --seed 0    --checkpoint_name v4lit_c2_t4
-python -m scripts.train ${COMMON} --use_Iy 1 --seed 777  --checkpoint_name v4lit_c2_t5
+# baseline: ego+nb(6D)
+for i in "${!SEEDS[@]}"; do
+  trial=$((i + 1))
+  python -m scripts.train ${COMMON} \
+    --feature_mode baseline \
+    --seed "${SEEDS[$i]}" \
+    --checkpoint_name "v4lit_baseline_t${trial}"
+done
+
+# dimI: ego+nb(6D)+dim(8)+I(9)
+for i in "${!SEEDS[@]}"; do
+  trial=$((i + 1))
+  python -m scripts.train ${COMMON} \
+    --feature_mode dimI \
+    --seed "${SEEDS[$i]}" \
+    --checkpoint_name "v4lit_dimI_t${trial}"
+done

@@ -14,13 +14,35 @@ logger = logging.getLogger(__name__)
 # HighD dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
-# x_nb feature indices (neighformer preprocess.py schema, 13 dims):
-#   dx(0) dy(1) dvx(2) dvy(3) dax(4) day(5)
-#   lc_state(6) volume(7) size_bin(8) gate(9) I_x(10) I_y(11) I(12)
+# x_nb feature indices (neighformer preprocess.py schema, 10 dims):
+#   dx(0) dy(1) dvx(2) dvy(3) dax(4) day(5) s_x(6) s_y(7) dim(8) I(9)
 _NB_BASE_INDICES = [0, 1, 2, 3, 4, 5]
 _NB_DIM_INDEX = 8    # vehicle size bin (0~4)
-_NB_IY_INDEX  = 11   # lateral importance
-_NB_I_INDEX   = 12   # composite importance
+_NB_I_INDEX   = 9    # composite importance
+_NB_FEATURE_MODES = {
+    'baseline': _NB_BASE_INDICES,
+    'dimI': _NB_BASE_INDICES + [_NB_DIM_INDEX, _NB_I_INDEX],
+}
+
+
+def highd_nb_feat_indices(feature_mode=None, use_I=False, use_Iy=False, use_dim=False):
+    if feature_mode is not None:
+        if feature_mode not in _NB_FEATURE_MODES:
+            choices = ', '.join(sorted(_NB_FEATURE_MODES))
+            raise ValueError(f"Unknown feature_mode={feature_mode!r}. Choose one of: {choices}")
+        return list(_NB_FEATURE_MODES[feature_mode])
+
+    # Legacy fallback for old checkpoints/commands.
+    extra = []
+    if use_dim:
+        extra.append(_NB_DIM_INDEX)
+    if use_I or use_Iy:
+        extra.append(_NB_I_INDEX)
+    return _NB_BASE_INDICES + extra
+
+
+def highd_nb_feat_dim(feature_mode=None, use_I=False, use_Iy=False, use_dim=False):
+    return len(highd_nb_feat_indices(feature_mode, use_I=use_I, use_Iy=use_Iy, use_dim=use_dim))
 
 
 class HighDDataset(Dataset):
@@ -31,7 +53,8 @@ class HighDDataset(Dataset):
       obs : ego (x, y) history of length obs_len
       pred: ego (x, y) future  of length pred_len
       nb_feats : neighbor features (obs_len, K, nb_feat_dim)
-                 features = [dx, dy, dvx, dvy, dax, day] + optionally [I]
+                 baseline = [dx, dy, dvx, dvy, dax, day]
+                 dimI = baseline + [dim, I]
       nb_mask  : (K,) bool — True if that neighbor slot is ever occupied
 
     The batch collated by seq_collate_highd has the same first-7-field
@@ -44,14 +67,15 @@ class HighDDataset(Dataset):
     """
 
     def __init__(self, mmap_path, obs_len=None, pred_len=None,
-                 use_I=False, use_Iy=False, use_dim=False, indices=None, threshold=0.002):
+                 feature_mode=None, use_I=False, use_Iy=False, use_dim=False,
+                 indices=None, threshold=0.002):
         super().__init__()
         mmap_path = Path(mmap_path)
 
         # Memory-mapped arrays (read-only, zero copy)
         self.x_ego   = np.load(mmap_path / 'x_ego.npy',   mmap_mode='r')  # (N, T, 6)
         self.y       = np.load(mmap_path / 'y.npy',        mmap_mode='r')  # (N, Tf, 2)
-        self.x_nb    = np.load(mmap_path / 'x_nb.npy',    mmap_mode='r')  # (N, T, K, 13)
+        self.x_nb    = np.load(mmap_path / 'x_nb.npy',    mmap_mode='r')  # (N, T, K, 10)
         self.nb_mask = np.load(mmap_path / 'nb_mask.npy', mmap_mode='r')  # (N, T, K)
 
         T_mmap  = self.x_ego.shape[1]
@@ -68,18 +92,13 @@ class HighDDataset(Dataset):
                 "or omit --obs_len / --pred_len to use mmap dimensions."
             )
 
+        self.feature_mode = feature_mode
         self.use_I     = use_I
         self.use_Iy    = use_Iy
         self.use_dim   = use_dim
         self.threshold = threshold
-        extra = []
-        if use_dim:
-            extra.append(_NB_DIM_INDEX)
-        if use_Iy:
-            extra.append(_NB_IY_INDEX)
-        elif use_I:
-            extra.append(_NB_I_INDEX)
-        self.nb_feat_indices = _NB_BASE_INDICES + extra
+        self.nb_feat_indices = highd_nb_feat_indices(
+            feature_mode, use_I=use_I, use_Iy=use_Iy, use_dim=use_dim)
 
         N = self.x_ego.shape[0]
         self.indices = np.asarray(indices) if indices is not None else np.arange(N)
@@ -113,7 +132,7 @@ class HighDDataset(Dataset):
         nl = poly_fit(obs_xy.T, self.obs_len, self.threshold)
 
         # ── neighbor features ──────────────────────────────────────────────
-        x_nb_raw = np.array(self.x_nb[idx], dtype=np.float32)       # (T, K, 13)
+        x_nb_raw = np.array(self.x_nb[idx], dtype=np.float32)       # (T, K, 10)
         nb_feats = x_nb_raw[:, :, self.nb_feat_indices]              # (T, K, F)
 
         mask_raw = np.array(self.nb_mask[idx])                       # (T, K) bool

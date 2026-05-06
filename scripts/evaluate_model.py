@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import torch
 import numpy as np
 import pandas as pd
@@ -107,6 +108,90 @@ def print_scenario_results(stats, label_type):
 
 
 # ─────────────────────────────────────
+# Latency measurement
+# ─────────────────────────────────────
+def print_device_info():
+    """Print device info that affects inference latency."""
+    print("\n====== Device Info ======")
+    print(f"  PyTorch version : {torch.__version__}")
+    if torch.cuda.is_available():
+        idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = props.total_memory / (1024 ** 3)
+        alloc_gb = torch.cuda.memory_allocated(idx) / (1024 ** 3)
+        free_gb = total_gb - alloc_gb
+        print(f"  Device          : {props.name}  (index={idx})")
+        print(f"  CUDA version    : {torch.version.cuda}")
+        print(f"  cuDNN version   : {torch.backends.cudnn.version()}")
+        print(f"  SM count        : {props.multi_processor_count}")
+        print(f"  VRAM            : {total_gb:.1f} GB total  /  {free_gb:.1f} GB free")
+        print(f"  cuDNN benchmark : {torch.backends.cudnn.benchmark}")
+    else:
+        import platform
+        cpu_name = platform.processor() or platform.machine() or "unknown"
+        print(f"  Device          : CPU  ({cpu_name})")
+
+
+@torch.no_grad()
+def measure_latency(fn, warmup=1000, iters=10000):
+    """
+    Measure single-inference latency (avg / min / max) in milliseconds.
+
+    CUDA: torch.cuda.Event based measurement
+    CPU : time.perf_counter based measurement
+    """
+    print(f"  GPU warm-up  : {warmup:,} iters ...", end=" ", flush=True)
+    for _ in range(warmup):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print("done")
+
+    times_ms = []
+    print(f"  Measurement  : {iters:,} iters ...", end=" ", flush=True)
+
+    if torch.cuda.is_available():
+        starter = torch.cuda.Event(enable_timing=True)
+        ender = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        for _ in range(iters):
+            starter.record()
+            fn()
+            ender.record()
+            torch.cuda.synchronize()
+            times_ms.append(starter.elapsed_time(ender))
+    else:
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            fn()
+            times_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    print("done")
+
+    arr = np.asarray(times_ms, dtype=np.float64)
+    return {
+        "avg_ms": float(arr.mean()),
+        "min_ms": float(arr.min()),
+        "max_ms": float(arr.max()),
+    }
+
+
+def print_latency(lat, batch_size, warmup, iters):
+    """Print latency avg / min / max table."""
+    c = 15
+    ws = [c, c, c]
+
+    print()
+    print(f"  Batch size : {batch_size}   Warmup : {warmup:,}   Measurement : {iters:,}")
+    print()
+    print(_sep(ws))
+    print(f"|{'Avg (ms)':^{c}}|{'Min (ms)':^{c}}|{'Max (ms)':^{c}}|")
+    print(_sep(ws))
+    print(f"|{lat['avg_ms']:^{c}.2f}|{lat['min_ms']:^{c}.2f}|{lat['max_ms']:^{c}.2f}|")
+    print(_sep(ws))
+
+
+# ─────────────────────────────────────
 # Argument
 # ─────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -115,6 +200,8 @@ parser.add_argument('--num_samples', default=20, type=int)
 parser.add_argument('--dset_type', default='test', type=str,
                     choices=['train', 'val', 'test'])
 parser.add_argument('--gpu_num', default='0', type=str)
+parser.add_argument('--measure_time', action='store_true',
+                    help='Measure inference latency (1,000 warmup + 10,000 iters)')
 
 # HighD
 parser.add_argument('--use_highd', default=1, type=bool_flag,
@@ -205,6 +292,42 @@ def _unpack_eval_batch(args, batch):
 
     return (obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel,
             non_linear_ped, loss_mask, seq_start_end, nb_feats, nb_mask)
+
+
+def _get_single_latency_inputs(args, loader):
+    """Build a batch_size=1 input from the first evaluation batch."""
+    first_batch = next(iter(loader))
+    (obs_traj, _pred_traj_gt, obs_traj_rel, _pred_traj_gt_rel,
+     _non_linear_ped, _loss_mask, _seq_start_end,
+     nb_feats, nb_mask) = _unpack_eval_batch(args, first_batch)
+
+    obs_traj = obs_traj[:, :1].contiguous()
+    obs_traj_rel = obs_traj_rel[:, :1].contiguous()
+    seq_start_end = torch.LongTensor([[0, 1]]).to(obs_traj.device)
+
+    if nb_feats is not None:
+        nb_feats = nb_feats[:, :1].contiguous()
+    if nb_mask is not None:
+        nb_mask = nb_mask[:1].contiguous()
+
+    return obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask
+
+
+@torch.no_grad()
+def measure_generator_latency(args, loader, generator, warmup=1000, iters=10000):
+    obs_traj, obs_traj_rel, seq_start_end, nb_feats, nb_mask = \
+        _get_single_latency_inputs(args, loader)
+
+    def _infer():
+        pred_rel = generator(
+            obs_traj, obs_traj_rel, seq_start_end,
+            nb_feats, nb_mask
+        )
+        relative_to_abs(pred_rel, obs_traj[-1])
+
+    print(f"\n====== Inference Latency ======")
+    lat = measure_latency(_infer, warmup=warmup, iters=iters)
+    print_latency(lat, batch_size=obs_traj.size(1), warmup=warmup, iters=iters)
 
 
 # ─────────────────────────────────────
@@ -324,6 +447,11 @@ def build_loader(eval_args, cli_args):
 # ─────────────────────────────────────
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
+    latency_warmup = 1_000
+    latency_iters = 10_000
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     if os.path.isdir(args.model_path):
         paths = [
@@ -354,19 +482,28 @@ def main(args):
         # Scenario labels
         sample_labels = None
         scenario_labels_path = args.scenario_labels
-        if scenario_labels_path is None and eval_args.get('use_highd', False):
+        if (not args.measure_time and scenario_labels_path is None
+                and eval_args.get('use_highd', False)):
             mmap_path = eval_args.get('highd_mmap_path', 'data/highD/mmap')
             candidate = Path(mmap_path) / 'scenario_labels.csv'
             if candidate.exists():
                 scenario_labels_path = str(candidate)
 
-        if scenario_labels_path:
+        if not args.measure_time and scenario_labels_path:
             labels_lut = load_scenario_labels(scenario_labels_path)
             if labels_lut is not None and eval_args.get('use_highd', False):
                 mmap_path = eval_args.get('highd_mmap_path', 'data/highD/mmap')
                 dset = loader.dataset
                 sample_labels = build_sample_label_list(
                     mmap_path, dset.indices, labels_lut)
+
+        if args.measure_time:
+            print_device_info()
+            measure_generator_latency(
+                eval_args, loader, generator,
+                warmup=latency_warmup, iters=latency_iters
+            )
+            continue
 
         ade, fde, rmse_val, total_traj, ev_stats, st_stats = evaluate(
             eval_args, loader, generator, args.num_samples, sample_labels

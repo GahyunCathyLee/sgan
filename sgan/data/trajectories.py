@@ -21,6 +21,8 @@ _NB_DIM_INDEX = 8    # vehicle size bin (0~4)
 _NB_I_INDEX   = 9    # composite importance
 _NB_FEATURE_MODES = {
     'baseline': _NB_BASE_INDICES,
+    'importance': _NB_BASE_INDICES + [_NB_I_INDEX],
+    'I': _NB_BASE_INDICES + [_NB_I_INDEX],
     'dimI': _NB_BASE_INDICES + [_NB_DIM_INDEX, _NB_I_INDEX],
 }
 
@@ -54,6 +56,7 @@ class HighDDataset(Dataset):
       pred: ego (x, y) future  of length pred_len
       nb_feats : neighbor features (obs_len, K, nb_feat_dim)
                  baseline = [dx, dy, dvx, dvy, dax, day]
+                 importance = baseline + [I]
                  dimI = baseline + [dim, I]
       nb_mask  : (K,) bool — True if that neighbor slot is ever occupied
 

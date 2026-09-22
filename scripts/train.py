@@ -106,8 +106,8 @@ parser.add_argument('--highd_val_ratio', default=0.1, type=float,
                     help='Fraction of recordings to use as validation '
                          '(only when --highd_split_dir is not set).')
 parser.add_argument('--feature_mode', default=None,
-                    choices=['baseline', 'dimI'],
-                    help='HighD neighbor feature mode: baseline=[0:6], dimI=[0:6]+dim(8)+I(9).')
+                    choices=['baseline', 'importance', 'I', 'dimI'],
+                    help='HighD neighbor feature mode: baseline=[0:6], importance=[0:6]+I(9), dimI=[0:6]+dim(8)+I(9).')
 parser.add_argument('--use_I', default=0, type=bool_flag,
                     help=argparse.SUPPRESS)
 parser.add_argument('--use_Iy', default=0, type=bool_flag,
@@ -152,6 +152,8 @@ def main(args):
     if args.feature_mode is None:
         if args.use_dim and args.use_I:
             args.feature_mode = 'dimI'
+        elif args.use_I or args.use_Iy:
+            args.feature_mode = 'importance'
         elif not args.use_dim and not args.use_I and not args.use_Iy:
             args.feature_mode = 'baseline'
 

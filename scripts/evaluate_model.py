@@ -202,6 +202,8 @@ parser.add_argument('--dset_type', default='test', type=str,
 parser.add_argument('--gpu_num', default='0', type=str)
 parser.add_argument('--measure_time', action='store_true',
                     help='Measure inference latency (1,000 warmup + 10,000 iters)')
+parser.add_argument('--seed', type=int, default=None,
+                    help='Optional random seed for stochastic evaluation')
 
 # HighD
 parser.add_argument('--use_highd', default=1, type=bool_flag,
@@ -447,6 +449,12 @@ def build_loader(eval_args, cli_args):
 # ─────────────────────────────────────
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_num
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
     latency_warmup = 1_000
     latency_iters = 10_000
 

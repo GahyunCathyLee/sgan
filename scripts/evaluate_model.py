@@ -177,7 +177,7 @@ def measure_latency(fn, warmup=1000, iters=10000):
 
 
 def print_latency(lat, batch_size, warmup, iters):
-    """Print latency avg / min / max table."""
+    """Print latency min / max / avg table."""
     c = 15
     ws = [c, c, c]
 
@@ -185,9 +185,9 @@ def print_latency(lat, batch_size, warmup, iters):
     print(f"  Batch size : {batch_size}   Warmup : {warmup:,}   Measurement : {iters:,}")
     print()
     print(_sep(ws))
-    print(f"|{'Avg (ms)':^{c}}|{'Min (ms)':^{c}}|{'Max (ms)':^{c}}|")
+    print(f"|{'Min (ms)':^{c}}|{'Max (ms)':^{c}}|{'Avg (ms)':^{c}}|")
     print(_sep(ws))
-    print(f"|{lat['avg_ms']:^{c}.2f}|{lat['min_ms']:^{c}.2f}|{lat['max_ms']:^{c}.2f}|")
+    print(f"|{lat['min_ms']:^{c}.2f}|{lat['max_ms']:^{c}.2f}|{lat['avg_ms']:^{c}.2f}|")
     print(_sep(ws))
 
 
@@ -202,6 +202,10 @@ parser.add_argument('--dset_type', default='test', type=str,
 parser.add_argument('--gpu_num', default='0', type=str)
 parser.add_argument('--measure_time', action='store_true',
                     help='Measure inference latency (1,000 warmup + 10,000 iters)')
+parser.add_argument('--latency_warmup', type=int, default=1000,
+                    help='Warmup iterations for --measure_time')
+parser.add_argument('--latency_iters', type=int, default=10000,
+                    help='Measurement iterations for --measure_time')
 parser.add_argument('--seed', type=int, default=None,
                     help='Optional random seed for stochastic evaluation')
 
@@ -455,9 +459,6 @@ def main(args):
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-    latency_warmup = 1_000
-    latency_iters = 10_000
-
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
 
@@ -509,7 +510,7 @@ def main(args):
             print_device_info()
             measure_generator_latency(
                 eval_args, loader, generator,
-                warmup=latency_warmup, iters=latency_iters
+                warmup=args.latency_warmup, iters=args.latency_iters
             )
             continue
 
